@@ -768,7 +768,7 @@ const App: React.FC = () => {
       <header className="mx-auto max-w-screen-2xl w-full px-6 pt-4 flex items-center justify-between">
         <div className="flex items-center gap-2">
           <span className="h-2.5 w-2.5 rounded-full bg-io-blue" />
-          <span className="text-sm font-semibold tracking-wider uppercase text-neutral-500 font-mono">BangHeri Data Analyst Workspace</span>
+          <span className="text-sm font-semibold tracking-wider uppercase text-neutral-500 font-mono">BangHeri AI Data Analyst Workspace</span>
         </div>
         
         <div className="flex items-center gap-3">
@@ -893,7 +893,7 @@ const SetupPanel: React.FC<SetupProps> = ({
         </h1>
         <div className="md:w-1/3 md:pt-1 flex flex-col justify-start">
           <p className="text-sm leading-relaxed text-neutral-800 font-medium">
-            BangHeri Data Analyst delivers interactive data intelligence, analytics, and actionable insights.
+            BangHeri AI Data Analyst delivers interactive data intelligence, analytics, and actionable insights.
           </p>
           <p className="mt-3 text-xs text-neutral-600">
             Upload one or more CSVs, ask a business question, and let the agent autonomously analyze it.
@@ -1937,7 +1937,7 @@ const ReportView: React.FC<{ report: AnalysisReport }> = ({ report }) => {
         pdf.setDrawColor(243, 244, 246);
         pdf.line(margin, pageHeight - 12, margin + contentWidth, pageHeight - 12);
 
-        pdf.text(`BangHeri Data Analyst Autonomous BI · Generated ${report.generated_at || new Date().toLocaleDateString()}`, margin, pageHeight - 7);
+        pdf.text(`BangHeri AI Data Analyst Autonomous BI · Generated ${report.generated_at || new Date().toLocaleDateString()}`, margin, pageHeight - 7);
         pdf.text(`Page ${i} of ${totalPages}`, margin + contentWidth - 18, pageHeight - 7);
       }
 
@@ -2335,7 +2335,7 @@ const ReportView: React.FC<{ report: AnalysisReport }> = ({ report }) => {
 
         {/* Methodology & Footer */}
         <div className="border-t border-neutral-200 pt-4 flex justify-between text-[11px] text-neutral-400 font-mono">
-          <span>BangHeri Data Analyst Autonomous Agent</span>
+          <span>BangHeri AI Data Analyst Autonomous Agent</span>
           <span>{report.methodology ? `Methodology: ${report.methodology}` : 'Confidential BI Dashboard'}</span>
         </div>
       </div>

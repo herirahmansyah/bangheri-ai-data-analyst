@@ -1,6 +1,6 @@
 {
-  "name": "BangHeri Data Analyst",
-  "description": "BangHeri Data Analyst delivers interactive data analytics and insights. Upload CSVs, ask a question, and let Gemini Managed Agents autonomously analyze it.",
+  "name": "BangHeri AI Data Analyst",
+  "description": "BangHeri AI Data Analyst delivers interactive data analytics and insights. Upload CSVs, ask a question, and let Gemini Managed Agents autonomously analyze it.",
   "requestFramePermissions": [],
   "majorCapabilities": [
     "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
