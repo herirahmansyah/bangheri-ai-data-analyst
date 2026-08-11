@@ -30,6 +30,10 @@ import {
   safeLog,
 } from "./server/lib/safeDiagnostics.ts";
 import { resolveGcsToken } from "./server/lib/gcpToken.ts";
+import {
+  JSON_BODY_LIMIT,
+  jsonBodyErrorHandler,
+} from "./server/lib/bodyLimit.ts";
 import fs from "fs";
 import crypto from "crypto";
 import multer from "multer";
@@ -326,7 +330,8 @@ async function startServer() {
   const publicBaseUrl = resolvePublicBaseUrl(PORT);
   verifyAgentYamlSync();
 
-  app.use(express.json({ limit: "50mb" }));
+  app.use(express.json({ limit: JSON_BODY_LIMIT }));
+  app.use(jsonBodyErrorHandler);
   app.use("/output", express.static(path.join(process.cwd(), "output")));
 
   // ── BYOK (Bring Your Own Key) ───────────────────────────────────────
