@@ -30,6 +30,7 @@ import {
   safeLog,
 } from "./server/lib/safeDiagnostics.ts";
 import { resolveGcsToken } from "./server/lib/gcpToken.ts";
+import { getGcsAvailabilityFailure } from "./server/lib/gcsAvailability.ts";
 import {
   JSON_BODY_LIMIT,
   jsonBodyErrorHandler,
@@ -778,6 +779,15 @@ async function startServer() {
     const gcsFiles = uploadedFiles.filter((f) => f.gsUri);
     const hasGcsFiles = gcsFiles.length > 0;
     const gcsToken = await resolveGcsToken(hasGcsFiles);
+    // R27 fail-closed: Fail closed when GCS credentials required by this
+    // server are unavailable, before instruction construction, SSE, and
+    // provider invocation.
+    const gcsAvailability = getGcsAvailabilityFailure(hasGcsFiles, gcsToken);
+    if (gcsAvailability) {
+      return res
+        .status(gcsAvailability.status)
+        .json({ error: gcsAvailability.message });
+    }
     let gcsInstructions = "";
     if (hasGcsFiles) {
       gcsInstructions = `The user uploaded ${gcsFiles.length} file(s) to Google Cloud Storage. First, you MUST run \`python /.agents/download_gcs.py\` to download them to /.agents/data/ before doing anything else.`;
