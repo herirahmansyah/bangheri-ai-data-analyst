@@ -1797,7 +1797,19 @@ const ReportView: React.FC<{ report: AnalysisReport }> = ({ report }) => {
             pdf.setFont('helvetica', 'bold');
             pdf.setFontSize(8);
             pdf.setTextColor(107, 114, 128);
-            pdf.text((kpi.metric || kpi.title || '').toUpperCase().slice(0, 32), x + 4, y + 6);
+            const kpiTitleRaw = (kpi.metric || kpi.title || '').toUpperCase();
+            const kpiAvailableWidth = colWidth - 8;
+            let kpiTitle = kpiTitleRaw;
+            if (pdf.getTextWidth(kpiTitleRaw) > kpiAvailableWidth) {
+              const ellipsis = '…';
+              let fit = '';
+              for (const ch of Array.from(kpiTitleRaw)) {
+                if (pdf.getTextWidth(fit + ch + ellipsis) > kpiAvailableWidth) break;
+                fit += ch;
+              }
+              kpiTitle = fit.trimEnd() + ellipsis;
+            }
+            pdf.text(kpiTitle, x + 4, y + 6);
 
             if (kpi.value) {
               pdf.setFont('helvetica', 'bold');
