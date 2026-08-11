@@ -29,29 +29,10 @@ import {
   safeErrorClass,
   safeLog,
 } from "./server/lib/safeDiagnostics.ts";
+import { resolveGcsToken } from "./server/lib/gcpToken.ts";
 import fs from "fs";
 import crypto from "crypto";
 import multer from "multer";
-
-async function getGcpAccessToken(): Promise<string | null> {
-  try {
-    const res = await fetch(
-      "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
-      {
-        headers: { "Metadata-Flavor": "Google" },
-      },
-    );
-    if (res.ok) {
-      const data: any = await res.json();
-      return data.access_token || null;
-    }
-  } catch (err) {
-    safeLog("warn", "gcp-token", "METADATA_FETCH_FAILED", {
-      error_class: safeErrorClass(err),
-    });
-  }
-  return null;
-}
 
 function extractTarInMemory(tarBuffer: Buffer): Record<string, Buffer> {
   const files: Record<string, Buffer> = {};
@@ -791,10 +772,9 @@ async function startServer() {
 
     const gcsFiles = uploadedFiles.filter((f) => f.gsUri);
     const hasGcsFiles = gcsFiles.length > 0;
-    let gcsToken: string | null = null;
+    const gcsToken = await resolveGcsToken(hasGcsFiles);
     let gcsInstructions = "";
     if (hasGcsFiles) {
-      gcsToken = await getGcpAccessToken();
       gcsInstructions = `The user uploaded ${gcsFiles.length} file(s) to Google Cloud Storage. First, you MUST run \`python /.agents/download_gcs.py\` to download them to /.agents/data/ before doing anything else.`;
     }
 
@@ -1086,9 +1066,6 @@ os.system("""python3 /.agents/skills/reporting/scripts/build_report.py --workspa
         );
       }
 
-      if (!gcsToken) {
-        gcsToken = await getGcpAccessToken();
-      }
       console.log(
         `[analyze] GCS access token present: ${gcsToken ? "yes" : "no"}.`,
       );
