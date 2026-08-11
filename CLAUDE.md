@@ -22,9 +22,11 @@ npm run clean    # rm -rf dist
 - There is **no test framework**. `npm run lint` (typecheck) is the only automated gate.
 - `npm run dev` serves both the API and the frontend from one process (Vite runs as Express
   middleware). The port auto-increments if 3000 is busy (see `startListening` in `server.ts`).
-- **Required env:** `GEMINI_API_KEY` in `.env.local` (falls back to `.env`). In hosted AI Studio
-  it is injected, so a missing file is fine there. Optional: `DAILY_QUOTA_LIMIT`, `NODE_ENV`,
-  `DISABLE_HMR=true`.
+- **Required env:** `PORT`, `NODE_ENV`, and `PUBLIC_BASE_URL` in production
+  (absolute https:// URL, fail-closed). **BYOK**: there is NO server-side
+  `GEMINI_API_KEY` — users paste their own key in the UI header; it is held
+  only in browser memory and sent per-request via the `x-gemini-api-key`
+  header. Optional: `DAILY_QUOTA_LIMIT`, `DISABLE_HMR=true`.
 
 ## Architecture — three tiers, one of them runs remotely
 

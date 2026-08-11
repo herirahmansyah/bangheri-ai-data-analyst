@@ -12,6 +12,23 @@ import {
   API_BASE_URL,
 } from "./server/lib/agentClient.ts";
 import { extractJsonBlocks } from "./server/lib/jsonExtractor.ts";
+import {
+  resolveCatalogId,
+  catalogContainsAgentName,
+  listCatalog,
+} from "./server/lib/modelCatalog.ts";
+import {
+  validateApiKey,
+  type KeyValidationFailureReason,
+} from "./server/lib/keyValidation.ts";
+import {
+  classifyUpstreamError,
+  upstreamErrorMessage,
+} from "./server/lib/upstreamErrors.ts";
+import {
+  safeErrorClass,
+  safeLog,
+} from "./server/lib/safeDiagnostics.ts";
 import fs from "fs";
 import crypto from "crypto";
 import multer from "multer";
@@ -29,10 +46,9 @@ async function getGcpAccessToken(): Promise<string | null> {
       return data.access_token || null;
     }
   } catch (err) {
-    console.warn(
-      "[getGcpAccessToken] Could not fetch token from metadata server:",
-      err,
-    );
+    safeLog("warn", "gcp-token", "METADATA_FETCH_FAILED", {
+      error_class: safeErrorClass(err),
+    });
   }
   return null;
 }
@@ -156,7 +172,7 @@ function cleanUpOldGenerations() {
         const age = now - stats.mtimeMs;
         if (age > maxAgeMs) {
           console.log(
-            `[cleanup] Directory ${item} is older than 24 hours (${Math.round(age / 1000 / 60 / 60)} hrs). Deleting to prevent storage bloat.`,
+            `[cleanup] A generation directory is older than 24 hours (${Math.round(age / 1000 / 60 / 60)} hrs). Deleting to prevent storage bloat.`,
           );
           try {
             fs.rmSync(itemPath, { recursive: true, force: true });
@@ -165,31 +181,295 @@ function cleanUpOldGenerations() {
               fs.unlinkSync(zipPath);
             }
           } catch (itemErr) {
-            console.error(`[cleanup] Failed to delete ${itemPath}:`, itemErr);
+            safeLog("error", "cleanup", "DELETE_FAILED", {
+              error_class: safeErrorClass(itemErr),
+            });
           }
         }
       }
     }
   } catch (err) {
-    console.error("[cleanup] Error cleaning up old generations:", err);
+    safeLog("error", "cleanup", "CLEANUP_SCAN_FAILED", {
+      error_class: safeErrorClass(err),
+    });
+  }
+}
+
+function resolvePort(): number {
+  const raw = process.env.PORT;
+  if (typeof raw === "string" && raw.trim() !== "") {
+    const trimmed = raw.trim();
+    const parsed = parseInt(trimmed, 10);
+    if (
+      !isNaN(parsed) &&
+      parsed >= 1 &&
+      parsed <= 65535 &&
+      String(parsed) === trimmed
+    ) {
+      return parsed;
+    }
+    console.warn(
+      `[config] Invalid PORT "${raw}" — falling back to 3000.`,
+    );
+  }
+  return 3000;
+}
+
+// Public base URL used by sandbox scripts that need to reach THIS server
+// (e.g. the generated GCS download script). It is deliberately NOT derived
+// from client-controlled Host / x-forwarded-proto headers — those are a code
+// injection vector into generated Python source. It is validated at startup:
+// - production requires an absolute https:// URL (fail-closed).
+// - development falls back to an explicit, safe http://localhost:<port>.
+function resolvePublicBaseUrl(port: number): string {
+  const raw = (process.env.PUBLIC_BASE_URL || "").trim();
+  const isProduction = process.env.NODE_ENV === "production";
+  if (raw === "") {
+    if (isProduction) {
+      console.error(
+        "[config] REFUSING TO START in NODE_ENV=production: PUBLIC_BASE_URL is required and must be an absolute https:// URL " +
+          "reachable from the Gemini sandbox (e.g. https://your-app.onrender.com). " +
+          "The service will exit now.",
+      );
+      process.exit(1);
+    }
+    const fallback = `http://localhost:${port}`;
+    console.warn(
+      `[config] PUBLIC_BASE_URL unset — using local fallback ${fallback} (development only).`,
+    );
+    return fallback;
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(raw);
+  } catch {
+    if (isProduction) {
+      console.error(
+        `[config] REFUSING TO START: PUBLIC_BASE_URL "${raw}" is not a valid absolute URL. The service will exit now.`,
+      );
+      process.exit(1);
+    }
+    const fallback = `http://localhost:${port}`;
+    console.warn(
+      `[config] Invalid PUBLIC_BASE_URL "${raw}" — using local fallback ${fallback} (development only).`,
+    );
+    return fallback;
+  }
+  if (parsed.protocol !== "https:" && parsed.protocol !== "http:") {
+    if (isProduction) {
+      console.error(
+        `[config] REFUSING TO START: PUBLIC_BASE_URL "${raw}" must use https:// in production. The service will exit now.`,
+      );
+      process.exit(1);
+    }
+    console.warn(
+      `[config] PUBLIC_BASE_URL "${raw}" uses a non-http(s) scheme — using it is not supported; falling back to local.`,
+    );
+    return `http://localhost:${port}`;
+  }
+  if (isProduction && parsed.protocol !== "https:") {
+    console.error(
+      `[config] REFUSING TO START: PUBLIC_BASE_URL "${raw}" must use https:// in production. The service will exit now.`,
+    );
+    process.exit(1);
+  }
+  if (!parsed.hostname) {
+    if (isProduction) {
+      console.error(
+        `[config] REFUSING TO START: PUBLIC_BASE_URL "${raw}" has no host. The service will exit now.`,
+      );
+      process.exit(1);
+    }
+    return `http://localhost:${port}`;
+  }
+  // Normalize: strip trailing slash and any path/query/fragment.
+  return `${parsed.protocol}//${parsed.host}`;
+}
+
+// Guard against silent drift between agent/agent.yaml (base_agent) and the
+// server-side model catalog. Warn loudly if they disagree.
+function verifyAgentYamlSync(): void {
+  try {
+    const yamlPath = path.join(process.cwd(), "agent", "agent.yaml");
+    if (!fs.existsSync(yamlPath)) {
+      console.warn(
+        "[catalog] agent/agent.yaml not found — cannot verify agent sync.",
+      );
+      return;
+    }
+    const yamlText = fs.readFileSync(yamlPath, "utf-8");
+    const match = yamlText.match(/^\s*base_agent:\s*["']?([A-Za-z0-9_.-]+)["']?/m);
+    const yamlAgent = match ? match[1] : null;
+    if (!yamlAgent) {
+      console.warn("[catalog] Could not parse base_agent from agent/agent.yaml.");
+      return;
+    }
+    if (!catalogContainsAgentName(yamlAgent)) {
+      console.error(
+        `[catalog] MISMATCH: agent/agent.yaml base_agent "${yamlAgent}" is NOT in the server catalog ` +
+          `[${listCatalog().map((e) => e.agentName).join(", ")}]. The runtime payload would silently use a ` +
+          "different agent than the bundled one. Refusing to continue in production.",
+      );
+      if (process.env.NODE_ENV === "production") {
+        process.exit(1);
+      }
+    } else {
+      console.log(
+        `[catalog] agent/agent.yaml base_agent "${yamlAgent}" matches the server catalog.`,
+      );
+    }
+  } catch (err) {
+    safeLog("warn", "catalog", "YAML_SYNC_CHECK_FAILED", {
+      error_class: safeErrorClass(err),
+    });
   }
 }
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = resolvePort();
+
+  // Trust exactly ONE reverse-proxy hop (Render's platform proxy sits directly
+  // in front of this service). With `trust proxy: 1`, Express derives req.ip
+  // from the right-most untrusted entry of X-Forwarded-For — i.e. the real
+  // client as seen by that single proxy — so a client-sent X-Forwarded-For
+  // cannot spoof the IP used for per-IP rate limiting. This assumes Render
+  // always proxies requests (never a direct connection to the origin port).
+  app.set("trust proxy", 1);
 
   // Run initial cleanup on startup
   cleanUpOldGenerations();
 
+  // Validate PUBLIC_BASE_URL (used by sandbox scripts to reach THIS server)
+  // and verify agent/agent.yaml stays in sync with the model catalog.
+  const publicBaseUrl = resolvePublicBaseUrl(PORT);
+  verifyAgentYamlSync();
+
   app.use(express.json({ limit: "50mb" }));
   app.use("/output", express.static(path.join(process.cwd(), "output")));
+
+  // ── BYOK (Bring Your Own Key) ───────────────────────────────────────
+  // Each analysis request carries the user's Gemini API key in the
+  // `x-gemini-api-key` header. The server reads it into a LOCAL variable for
+  // that request only — it is never stored on module scope, in process.env,
+  // in a database, on disk, in a cookie, in a server-side session, in the
+  // URL, in analytics, or in logs. There is NO server-side fallback key.
+  // /api/health and /api/upload do NOT need a key (they never call Gemini).
+  const analyzeHits = new Map<string, number[]>();
+  // Per-key limiter buckets. Keyed by SHA-256 FINGERPRINT of the user's key
+  // (never the key itself). Fingerprints live only in memory, are never
+  // logged or returned to the client, and reset on restart. This is an abuse
+  // GUARD, not a spending cap — real cost control needs persistent state.
+  const analyzeKeyHits = new Map<string, number[]>();
+
+  function rateLimitKey(key: string, windowMs: number, max: number): boolean {
+    const now = Date.now();
+    const cutoff = now - windowMs;
+    const timestamps = (analyzeHits.get(key) || []).filter((t) => t > cutoff);
+    if (timestamps.length >= max) {
+      analyzeHits.set(key, timestamps);
+      return false;
+    }
+    timestamps.push(now);
+    analyzeHits.set(key, timestamps);
+    return true;
+  }
+
+  function rateLimitKeyedByFingerprint(
+    fingerprint: string,
+    windowMs: number,
+    max: number,
+  ): boolean {
+    const now = Date.now();
+    const cutoff = now - windowMs;
+    const timestamps = (analyzeKeyHits.get(fingerprint) || []).filter(
+      (t) => t > cutoff,
+    );
+    if (timestamps.length >= max) {
+      analyzeKeyHits.set(fingerprint, timestamps);
+      return false;
+    }
+    timestamps.push(now);
+    analyzeKeyHits.set(fingerprint, timestamps);
+    return true;
+  }
+
+  function keyFingerprint(apiKey: string): string {
+    return crypto.createHash("sha256").update(apiKey, "utf8").digest("hex");
+  }
+
+  function clientIp(req: express.Request): string {
+    // `trust proxy: 1` (set above) makes req.ip reliable under a single
+    // reverse-proxy hop (Render). The fallback covers direct/local access.
+    return req.ip || req.socket?.remoteAddress || "unknown";
+  }
+
+  // Read + validate the BYOK key from the request header using the single
+  // centralized validator (server/lib/keyValidation.ts). Returns the validated
+  // key string (used only in local request scope) or the failure reason.
+  // Invalid keys are rejected here — BEFORE fingerprinting, catalog
+  // processing, or any network call. The key itself is never logged, stored,
+  // or returned; only a 400 with a safe message is.
+  function extractValidApiKey(
+    req: express.Request,
+  ): { apiKey: string; reason: null } | { apiKey: null; reason: KeyValidationFailureReason } {
+    const validation = validateApiKey(req.headers["x-gemini-api-key"]);
+    if (validation.reason !== null) {
+      // `reason` is null iff valid; narrows the union without needing
+      // strictNullChecks (repo tsconfig has `strict` disabled).
+      return { apiKey: null, reason: validation.reason };
+    }
+    return { apiKey: req.headers["x-gemini-api-key"] as string, reason: null };
+  }
+
+  const API_KEY_ERROR_MESSAGES: Record<KeyValidationFailureReason, string> = {
+    MISSING:
+      "Missing x-gemini-api-key header. This endpoint is BYOK: provide your own Gemini API key.",
+    MULTIPLE_VALUES:
+      "Invalid x-gemini-api-key header: multiple values are not allowed.",
+    NOT_STRING: "Invalid x-gemini-api-key header value.",
+    BLANK: "Invalid x-gemini-api-key header: the key is blank.",
+    INVALID_CHARS:
+      "Invalid x-gemini-api-key header: the key contains unsupported characters.",
+    TOO_LONG:
+      "Invalid x-gemini-api-key header: the key is too long (maximum 1024 bytes).",
+  };
+
+  // Apply conservative rate limits to the analysis endpoint. The GLOBAL
+  // private-preview limiter was removed in CP5.1 (no service-wide cap).
+  // Order per request: 1) BYOK key present + format-valid  2) per-IP limiter
+  //   3) per-key fingerprint limiter  4) /api/analyze handler.
+  // - 6 attempts per minute per IP for /api/analyze
+  // - 20 analyses per 10 minutes per key (abuse guard, in-memory)
+  // - 6 uploads per minute per IP for /api/upload (no Gemini, no key needed)
+  app.post("/api/analyze", (req, res, next) => {
+    const extracted = extractValidApiKey(req);
+    if (!extracted.apiKey) {
+      return res.status(400).json({
+        error: API_KEY_ERROR_MESSAGES[extracted.reason],
+      });
+    }
+    if (!rateLimitKey(`analyze:${clientIp(req)}`, 60_000, 6)) {
+      return res.status(429).json({
+        error:
+          "Too many analysis requests. Please wait a moment and try again.",
+      });
+    }
+    const fingerprint = keyFingerprint(extracted.apiKey);
+    if (!rateLimitKeyedByFingerprint(fingerprint, 10 * 60_000, 20)) {
+      return res.status(429).json({
+        error:
+          "Too many analysis requests for this Gemini API key. Please wait a few minutes (abuse guard, not a spending cap).",
+      });
+    }
+    next();
+  });
 
   // API routes FIRST
   app.post("/api/cancel-show", (req, res) => {
     const { generationId } = req.body;
     if (generationId && activeGenerations.has(generationId)) {
-      console.log(`[cancel-show] Human requested abort for ${generationId}`);
+      console.log(`[cancel-show] Human requested abort (generation registered).`);
       activeGenerations.get(generationId)?.abort();
       activeGenerations.delete(generationId);
       res.json({ success: true });
@@ -227,12 +507,10 @@ async function startServer() {
       const buffer = Buffer.from(arrayBuffer);
       res.send(buffer);
     } catch (err) {
-      console.error("Download proxy failed:", err);
-      res
-        .status(500)
-        .send(
-          `Internal server error: ${err instanceof Error ? err.message : String(err)}`,
-        );
+      safeLog("error", "download-proxy", "PROXY_FETCH_FAILED", {
+        error_class: safeErrorClass(err),
+      });
+      res.status(500).send("Failed to download the requested file.");
     }
   });
 
@@ -283,7 +561,9 @@ async function startServer() {
         return cache[cacheKey] || 0;
       }
     } catch (err) {
-      console.error("Error reading quota cache:", err);
+      safeLog("error", "quota", "CACHE_READ_FAILED", {
+        error_class: safeErrorClass(err),
+      });
     }
     return 0;
   }
@@ -301,7 +581,9 @@ async function startServer() {
           const data = fs.readFileSync(QUOTA_CACHE_FILE, "utf-8");
           cache = JSON.parse(data);
         } catch (e) {
-          console.error("Error parsing quota file cache on increment:", e);
+          safeLog("error", "quota", "CACHE_PARSE_FAILED", {
+            error_class: safeErrorClass(e),
+          });
         }
       }
       const cacheKey = `${getTodayStr()}_${userHash}`;
@@ -312,7 +594,9 @@ async function startServer() {
         "utf-8",
       );
     } catch (err) {
-      console.error("Error incrementing quota cache:", err);
+      safeLog("error", "quota", "CACHE_WRITE_FAILED", {
+        error_class: safeErrorClass(err),
+      });
     }
   }
 
@@ -331,7 +615,7 @@ async function startServer() {
 
   const upload = multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: 50 * 1024 * 1024 }, // 50MB limit
+    limits: { fileSize: 1 * 1024 * 1024 }, // 1MB limit
   });
 
   const uploadSingle = upload.single("file");
@@ -339,25 +623,36 @@ async function startServer() {
   app.post(
     "/api/upload",
     (req, res, next) => {
+      if (!rateLimitKey(`upload:${clientIp(req)}`, 60_000, 6)) {
+        return res.status(429).json({
+          error:
+            "Too many uploads. Please wait a moment and try again.",
+        });
+      }
+      next();
+    },
+    (req, res, next) => {
       uploadSingle(req, res, (err) => {
         if (err) {
           if (err instanceof multer.MulterError) {
             if (err.code === "LIMIT_FILE_SIZE") {
               return res
-                .status(400)
+                .status(413)
                 .json({
-                  error: "File is too large. The maximum allowed size is 50MB.",
+                  error:
+                    "File is too large. The maximum allowed size is 1MB.",
                 });
             }
             return res
               .status(400)
-              .json({ error: `Upload error: ${err.message}` });
+              .json({ error: "Upload rejected by the server." });
           }
+          safeLog("error", "api/upload", "UPLOAD_MIDDLEWARE_FAILED", {
+            error_class: safeErrorClass(err),
+          });
           return res
             .status(500)
-            .json({
-              error: err.message || "An unknown error occurred during upload.",
-            });
+            .json({ error: "An unknown error occurred during upload." });
         }
         next();
       });
@@ -368,11 +663,11 @@ async function startServer() {
           return res.status(400).json({ error: "No file uploaded" });
         }
 
-        // Inline limit: 1 MB per file
+        // Inline limit: 1 MB per file (multer also enforces the same cap)
         const MAX_INLINE_SIZE = 1 * 1024 * 1024; // 1 MB
         if (req.file.size > MAX_INLINE_SIZE) {
-          return res.status(400).json({
-            error: `File "${req.file.originalname}" is ${(req.file.size / (1024 * 1024)).toFixed(2)} MB, which exceeds the 1MB inline limit. For CSV files larger than 1MB, please use the "Paste a GCS URI" option!`,
+          return res.status(413).json({
+            error: `File "${req.file.originalname}" is ${(req.file.size / (1024 * 1024)).toFixed(2)} MB, which exceeds the 1MB upload limit.`,
           });
         }
 
@@ -394,11 +689,13 @@ async function startServer() {
 
           // Firebase upload omitted
         } catch (gcsErr) {
-          console.warn("[api/upload] Optional GCS upload omitted:", gcsErr);
+          safeLog("warn", "api/upload", "GCS_UPLOAD_OMITTED", {
+            error_class: safeErrorClass(gcsErr),
+          });
         }
 
         console.log(
-          `[api/upload] Processed inline CSV upload for ${safeOriginalName} (${req.file.size} bytes)`,
+          `[api/upload] Processed inline CSV upload (${req.file.size} bytes).`,
         );
         return res.json({
           name: req.file.originalname,
@@ -408,10 +705,10 @@ async function startServer() {
           url,
         });
       } catch (err: any) {
-        console.error("[api/upload] CSV upload failed:", err);
-        res
-          .status(500)
-          .json({ error: `Upload failed: ${err.message || err}` });
+        safeLog("error", "api/upload", "CSV_UPLOAD_FAILED", {
+          error_class: safeErrorClass(err),
+        });
+        res.status(500).json({ error: "Upload failed. Please try again." });
       }
     },
   );
@@ -432,14 +729,37 @@ async function startServer() {
     // Run background cleanup whenever a new analysis is requested to optimize disk space
     cleanUpOldGenerations();
 
+    // BYOK: validate + read the user's key ONCE, into a local variable scoped
+    // to this request. It is passed by argument to every Google fetch this
+    // request makes and is never stored anywhere. Same centralized validator
+    // as the middleware (defense in depth).
+    const extracted = extractValidApiKey(req);
+    if (!extracted.apiKey) {
+      return res.status(400).json({
+        error: API_KEY_ERROR_MESSAGES[extracted.reason],
+      });
+    }
+    const apiKey = extracted.apiKey;
+
     const {
       question,
       files,
       datasetName = "Dataset",
       generationId,
       environmentId,
+      catalogId,
       googleToken,
     } = req.body;
+
+    // Resolve the client-supplied catalogId against the server allowlist
+    // BEFORE any Gemini network call. Unknown IDs get a 400.
+    const catalogEntry = resolveCatalogId(catalogId);
+    if (!catalogEntry) {
+      return res.status(400).json({
+        error:
+          "Unknown catalogId. The browser must send one of the server-approved catalog ids (see server/lib/modelCatalog.ts).",
+      });
+    }
 
     if (!question || typeof question !== "string" || question.trim() === "") {
       return res
@@ -633,7 +953,7 @@ os.system("""python3 /.agents/skills/reporting/scripts/build_report.py --workspa
       let agentFiles: AgentSource[] = [];
       if (isFollowUp) {
         console.log(
-          `[analyze] Continuing session in active environment: "${environmentId}" without interaction chaining.`,
+          "[analyze] Continuing session in the active environment without interaction chaining.",
         );
         sendEvent({
           type: "info",
@@ -641,10 +961,7 @@ os.system("""python3 /.agents/skills/reporting/scripts/build_report.py --workspa
         });
       } else {
         console.log(
-          `[analyze] Request received. dataset: "${effectiveDatasetName}", source: ${uploadedFiles.length} uploaded file(s), question: "${question.substring(0, 80)}...", generationId: "${generationId}"`,
-        );
-        console.log(
-          `[analyze] GEMINI_API_KEY presence verified: ${!!process.env.GEMINI_API_KEY}`,
+          `[analyze] Request accepted. catalogId="${catalogEntry.id}", files=${uploadedFiles.length}.`,
         );
         sendEvent({
           type: "info",
@@ -652,7 +969,7 @@ os.system("""python3 /.agents/skills/reporting/scripts/build_report.py --workspa
         });
 
         console.log(
-          `[analyze] Loading agent files from filesystem path: ${path.join(process.cwd(), "agent")}`,
+          "[analyze] Loading agent files from the bundled agent tree.",
         );
         agentFiles = loadAgentFiles(
           path.join(process.cwd(), "agent"),
@@ -680,11 +997,11 @@ os.system("""python3 /.agents/skills/reporting/scripts/build_report.py --workspa
         });
 
         // Uploads are fetched from GCS inside the sandbox via /.agents/download_gcs.py.
+        // SECURITY (CP5): the script URL is PUBLIC_BASE_URL — an env-validated
+        // value — NEVER the client-controlled Host / x-forwarded-proto headers.
+        // All dynamic values are embedded with JSON.stringify (safe serialization)
+        // via string concatenation, NOT quote interpolation into a template.
         if (hasGcsFiles) {
-          const protocol = req.headers["x-forwarded-proto"] || "http";
-          const host = req.headers.host || "localhost:3000";
-          const serverUrl = `${protocol}://${host}`;
-
           const gcsFilesToDownload = gcsFiles.map((f) => {
             const safeName = path.posix
               .basename(f.name)
@@ -702,63 +1019,62 @@ os.system("""python3 /.agents/skills/reporting/scripts/build_report.py --workspa
             };
           });
 
-          const gcsDownloadScript = `
-import urllib.request
-import urllib.parse
-import os
+          const filesLiteral = JSON.stringify(gcsFilesToDownload);
+          const serverUrlLiteral = JSON.stringify(publicBaseUrl);
+          const tokenLiteral = gcsToken ? JSON.stringify(gcsToken) : "None";
 
-
-files = [
-${gcsFilesToDownload.map((f) => `    {"source": "${f.source}", "filename": "${f.filename}", "target": "${f.target}"}`).join(",\n")}
-]
-
-
-server_url = "${serverUrl}"
-token = ${gcsToken ? `"${gcsToken}"` : "None"}
-os.makedirs("/.agents/data", exist_ok=True)
-
-
-for f in files:
-   filename = f["filename"]
-   # 1. First attempt: Download via the secure local Express download proxy (works without direct GCS access or public permission)
-   proxy_url = f"{server_url}/api/download-file?filename={urllib.parse.quote(filename)}"
-   print(f"Attempting download for {filename} via proxy: {proxy_url}")
-   try:
-       req = urllib.request.Request(proxy_url)
-       with urllib.request.urlopen(req) as response, open(f["target"], "wb") as out:
-           out.write(response.read())
-       print(f"Successfully downloaded {filename} via Express proxy")
-       continue
-   except Exception as proxy_err:
-       print(f"Express proxy download failed: {proxy_err}. Falling back to direct GCS download...")
-
-
-   # 2. Second attempt / fallback: Direct GCS API download
-   uri = f["source"]
-   if uri.startswith("gs://"):
-       parts = uri[5:].split("/", 1)
-       bucket = parts[0]
-       obj = parts[1]
-       encoded_obj = urllib.parse.quote(obj)
-       url_json = f"https://storage.googleapis.com/storage/v1/b/{bucket}/o/{encoded_obj}?alt=media"
-       url_xml = f"https://storage.googleapis.com/{bucket}/{encoded_obj}"
-      
-       success = False
-       for url in [url_json, url_xml]:
-           req = urllib.request.Request(url)
-           if token:
-               req.add_header("Authorization", "Bearer " + token)
-           try:
-               with urllib.request.urlopen(req) as response, open(f["target"], "wb") as out:
-                   out.write(response.read())
-               print(f"Successfully downloaded {f['source']} from {url}")
-               success = True
-               break
-           except Exception as e:
-               print(f"Failed download from {url}: {e}")
-       if not success:
-           print(f"Failed all download attempts for {f['source']}")
-`;
+          const gcsDownloadScript = [
+            "import urllib.request",
+            "import urllib.parse",
+            "import os",
+            "",
+            "files = " + filesLiteral,
+            "",
+            "server_url = " + serverUrlLiteral,
+            "token = " + tokenLiteral,
+            'os.makedirs("/.agents/data", exist_ok=True)',
+            "",
+            "for f in files:",
+            '   filename = f["filename"]',
+            '   # 1. First attempt: Download via the secure local Express download proxy',
+            '   proxy_url = f"{server_url}/api/download-file?filename={urllib.parse.quote(filename)}"',
+            '   print(f"Attempting download for {filename} via proxy: {proxy_url}")',
+            "   try:",
+            '       req = urllib.request.Request(proxy_url)',
+            '       with urllib.request.urlopen(req) as response, open(f["target"], "wb") as out:',
+            "           out.write(response.read())",
+            '       print(f"Successfully downloaded {filename} via Express proxy")',
+            "       continue",
+            "   except Exception as proxy_err:",
+            '       print(f"Express proxy download failed: {proxy_err}. Falling back to direct GCS download...")',
+            "",
+            "   # 2. Second attempt / fallback: Direct GCS API download",
+            '   uri = f["source"]',
+            '   if uri.startswith("gs://"):',
+            '       parts = uri[5:].split("/", 1)',
+            "       bucket = parts[0]",
+            "       obj = parts[1]",
+            "       encoded_obj = urllib.parse.quote(obj)",
+            '       url_json = f"https://storage.googleapis.com/storage/v1/b/{bucket}/o/{encoded_obj}?alt=media"',
+            '       url_xml = f"https://storage.googleapis.com/{bucket}/{encoded_obj}"',
+            "",
+            "       success = False",
+            "       for url in [url_json, url_xml]:",
+            "           req = urllib.request.Request(url)",
+            "           if token:",
+            '               req.add_header("Authorization", "Bearer " + token)',
+            "           try:",
+            '               with urllib.request.urlopen(req) as response, open(f["target"], "wb") as out:',
+            "                   out.write(response.read())",
+            '               print(f"Successfully downloaded {f[\'source\']} from {url}")',
+            "               success = True",
+            "               break",
+            "           except Exception as e:",
+            '               print(f"Failed download from {url}: {e}")',
+            "       if not success:",
+            '           print(f"Failed all download attempts for {f[\'source\']}")',
+            "",
+          ].join("\n");
           agentFiles.push({
             type: "inline",
             content: gcsDownloadScript,
@@ -774,14 +1090,16 @@ for f in files:
         gcsToken = await getGcpAccessToken();
       }
       console.log(
-        `[analyze] Retrieved GCS access token: ${gcsToken ? "yes (length: " + gcsToken.length + ")" : "no"}`,
+        `[analyze] GCS access token present: ${gcsToken ? "yes" : "no"}.`,
       );
 
       console.log(
-        `[analyze] Calling createInteraction with prompt: "${prompt.substring(0, 100)}..."`,
+        `[analyze] Calling createInteraction with agent="${catalogEntry.agentName}" (catalogId="${catalogEntry.id}").`,
       );
       const response = await createInteraction({
         prompt,
+        agentName: catalogEntry.agentName,
+        apiKey,
         stream: true,
         inlineSources: isFollowUp
           ? undefined
@@ -794,56 +1112,25 @@ for f in files:
       });
 
       console.log(
-        `[analyze] Gemini API responded. HTTP Status: ${response.status} ${response.statusText}`,
+        `[analyze] Gemini API responded. HTTP Status: ${response.status}`,
       );
 
       if (!response.ok) {
-        const errorText = await response.text();
-        console.error(
-          `[analyze] Gemini API Non-2xx response. Error Payload: ${errorText}`,
-        );
-
-        let displayMessage = `Agent API error: ${response.status} - ${errorText}`;
+        // CP5.2 + CP5.3: never forward or READ the raw upstream body.
+        // Upstream error bodies can echo secret material (e.g. a prefix of the
+        // API key), so the body is cancelled/discarded WITHOUT reading it —
+        // never buffered, logged, or forwarded. No response.text()/json() here.
+        const status = response.status;
         try {
-          const parsed = JSON.parse(errorText);
-          if (parsed?.error?.message) {
-            displayMessage = parsed.error.message;
-          }
-        } catch (e) {
-          // ignore parsing error, stick to default
+          await response.body?.cancel();
+        } catch {
+          // ignore cancel/discard errors
         }
-
-        const isQuotaError =
-          response.status === 429 ||
-          errorText.toLowerCase().includes("quota") ||
-          errorText.toLowerCase().includes("too_many_requests") ||
-          errorText.toLowerCase().includes("resource_exhausted") ||
-          displayMessage.toLowerCase().includes("quota") ||
-          displayMessage.toLowerCase().includes("too_many_requests");
-
-        const isEnvNotFoundError =
-          response.status === 404 ||
-          errorText.toLowerCase().includes("not_found") ||
-          errorText.toLowerCase().includes("environment not found") ||
-          displayMessage.toLowerCase().includes("environment not found") ||
-          displayMessage.toLowerCase().includes("not found or not accessible");
-
-        const isPermissionError =
-          response.status === 403 ||
-          errorText.toLowerCase().includes("permission_denied") ||
-          errorText.toLowerCase().includes("permission") ||
-          displayMessage.toLowerCase().includes("permission") ||
-          displayMessage.toLowerCase().includes("does not have permission");
-
-        if (isQuotaError) {
-          displayMessage = `Gemini API Quota Limit Reached: ${displayMessage}. The shared free-tier Google Gemini API Key has run out of request quota. To resolve this, go to Settings > Secrets inside AI Studio to verify your personal Gemini API key or set up billing.`;
-        } else if (isPermissionError) {
-          displayMessage = `Gemini API Permission Denied: ${displayMessage}. Accessing the Antigravity Agent requires a Gemini API Key with paid tier / billing enabled. Please go to Settings > Secrets in AI Studio to set or verify your personal Gemini API key with billing enabled.`;
-        } else if (isEnvNotFoundError) {
-          displayMessage = `The previous analysis session has expired or the remote environment has been recycled due to inactivity. Please start a fresh analysis session by uploading your CSV files again.`;
-        }
-
-        sendError(displayMessage);
+        const kind = classifyUpstreamError(status);
+        console.error(
+          `[analyze] Upstream error (${status}) — mapped to "${kind}". Raw upstream body not logged or forwarded.`,
+        );
+        sendError(upstreamErrorMessage(kind));
         res.end();
         return;
       }
@@ -874,7 +1161,7 @@ for f in files:
             extractInteractionId(event.interaction) || interactionId;
           sendSessionEnvironment(envId);
           console.log(
-            `[analyze] Interaction created. Environment ID: "${envId}", interaction ID: "${interactionId}"`,
+            "[analyze] Interaction created. Environment recovered from event.",
           );
         }
         if (event.type === "complete") {
@@ -883,7 +1170,7 @@ for f in files:
             extractInteractionId(event.interaction) || interactionId;
           sendSessionEnvironment(envId);
           console.log(
-            `[analyze] Interaction completed. Extracted environment ID: "${envId}"`,
+            "[analyze] Interaction completed. Environment recovered from event.",
           );
           const usage = event.interaction?.usage as any;
           if (usage) {
@@ -927,19 +1214,14 @@ for f in files:
           }
         }
 
-        // Log events to the terminal as well
+        // Log events to the terminal as well (metadata only — never agent
+        // output text, tool arguments, or tool results).
         if (event.type === "thinking")
-          console.log(
-            `[agent] thinking delta: ${event.text?.substring(0, 30)}...`,
-          );
+          console.log("[agent] thinking delta received.");
         else if (event.type === "tool_call") {
-          console.log(`[agent] tool_call: ${event.name}`);
-          console.log(
-            `[agent] args:`,
-            JSON.stringify(event.arguments, null, 2),
-          );
+          console.log(`[agent] tool_call received (tool=${event.name}).`);
         } else if (event.type === "tool_result") {
-          console.log(`[agent] tool_result for tool: ${event.name}`);
+          console.log(`[agent] tool_result received (tool=${event.name}).`);
           if (
             event.result?.includes("Report saved to") &&
             event.result.includes("report.json")
@@ -950,9 +1232,7 @@ for f in files:
             );
           }
         } else if (event.type === "text") {
-          console.log(
-            `[agent] text output segment: ${event.text?.substring(0, 30)}...`,
-          );
+          console.log("[agent] text output segment received.");
         }
 
         sendEvent(event);
@@ -979,7 +1259,7 @@ for f in files:
             `${API_BASE_URL}/${interactionPath}`,
             {
               headers: {
-                "x-goog-api-key": process.env.GEMINI_API_KEY || "",
+                "x-goog-api-key": apiKey,
                 "Api-Revision": "2026-05-20",
                 "x-goog-api-client": "applet-ai-data-analyst/1.0.0",
               },
@@ -990,18 +1270,17 @@ for f in files:
             envId = extractEnvironmentId(interactionData);
             sendSessionEnvironment(envId);
             console.log(
-              `[analyze] Recovered environment ID from interaction resource: "${envId}"`,
+              "[analyze] Recovered environment ID from interaction resource.",
             );
           } else {
             console.warn(
-              `[analyze] Could not recover interaction metadata: ${interactionRes.status} ${interactionRes.statusText}`,
+              `[analyze] Could not recover interaction metadata (HTTP ${interactionRes.status}).`,
             );
           }
         } catch (metadataErr) {
-          console.warn(
-            "[analyze] Interaction metadata recovery failed:",
-            metadataErr,
-          );
+          safeLog("warn", "analyze", "INTERACTION_METADATA_RECOVERY_FAILED", {
+            error_class: safeErrorClass(metadataErr),
+          });
         }
       }
 
@@ -1022,10 +1301,9 @@ for f in files:
             sendEvent({ type: "report_data", data: reportBlock });
           }
         } catch (e) {
-          console.error(
-            "Failed to parse JSON blocks fallback from accumulated text:",
-            e,
-          );
+          safeLog("error", "analyze", "JSON_BLOCK_PARSE_FAILED", {
+            error_class: safeErrorClass(e),
+          });
         }
       }
 
@@ -1041,7 +1319,7 @@ for f in files:
           let res: Response | null = null;
           for (let attempt = 1; attempt <= 5; attempt++) {
             res = await fetch(downloadUrl, {
-              headers: { "x-goog-api-key": process.env.GEMINI_API_KEY || "" },
+              headers: { "x-goog-api-key": apiKey },
             });
             if (
               res.ok ||
@@ -1089,10 +1367,9 @@ for f in files:
                 try {
                   report = JSON.parse(fileContent.toString("utf8"));
                 } catch (err) {
-                  console.error(
-                    "Failed to parse report.json from memory:",
-                    err,
-                  );
+                  safeLog("error", "analyze", "REPORT_JSON_PARSE_FAILED", {
+                    error_class: safeErrorClass(err),
+                  });
                 }
               } else if (
                 normalized.includes("charts/") &&
@@ -1108,7 +1385,9 @@ for f in files:
                   fs.writeFileSync(targetFilePath, fileContent);
                   chartImages[base] = `/output/${runId}/charts/${base}`;
                 } catch (writeErr) {
-                  console.error(`Failed to write chart ${base} to disk:`, writeErr);
+                  safeLog("error", "analyze", "CHART_WRITE_FAILED", {
+                    error_class: safeErrorClass(writeErr),
+                  });
                 }
               }
             }
@@ -1174,10 +1453,9 @@ for f in files:
                       });
                     }
                   } catch (csvErr) {
-                    console.error(
-                      `Failed to parse csv fallback for ${normalized}:`,
-                      csvErr,
-                    );
+                    safeLog("error", "analyze", "CSV_FALLBACK_PARSE_FAILED", {
+                      error_class: safeErrorClass(csvErr),
+                    });
                   }
                 }
               }
@@ -1276,37 +1554,38 @@ for f in files:
               sendError("The analysis ran but report.json was not produced.");
             }
           } else {
-            const errBody = res ? await res.text() : "No response received";
-            console.error("Failed to download snapshot:", errBody);
-            let displayMessage = `Failed to retrieve files from the analysis environment: ${errBody}`;
+            // CP5.2 + CP5.3: never forward or read the raw snapshot error body
+            // (may echo secrets). Cancel/discard it without reading, then map
+            // the status to a safe, human message.
+            const errStatus = res ? res.status : 0;
             try {
-              const parsed = JSON.parse(errBody);
-              if (parsed?.error?.message) {
-                const msg = parsed.error.message.toLowerCase();
-                if (
-                  msg.includes("not found") ||
-                  msg.includes("not accessible")
-                ) {
-                  displayMessage =
-                    "The previous analysis session has expired or the remote environment has been recycled due to inactivity. Please start a fresh analysis session by uploading your CSV files again.";
-                } else {
-                  displayMessage = parsed.error.message;
-                }
-              }
-            } catch (e) {
-              if (
-                errBody.toLowerCase().includes("not found") ||
-                errBody.toLowerCase().includes("not accessible")
-              ) {
-                displayMessage =
-                  "The previous analysis session has expired or the remote environment has been recycled due to inactivity. Please start a fresh analysis session by uploading your CSV files again.";
-              }
+              await res?.body?.cancel();
+            } catch {
+              // ignore cancel/discard errors
             }
-            sendError(displayMessage);
+            const kind = classifyUpstreamError(errStatus);
+            console.error(
+              `[analyze] Snapshot download failed (status ${errStatus}) — mapped to "${kind}". Raw upstream body not logged or forwarded.`,
+            );
+            if (
+              kind === "not_found" ||
+              errStatus === 409 ||
+              errStatus === 425
+            ) {
+              sendError(
+                "The previous analysis session has expired or the remote environment has been recycled due to inactivity. Please start a fresh analysis session by uploading your CSV files again.",
+              );
+            } else {
+              sendError(upstreamErrorMessage(kind));
+            }
           }
         } catch (err: any) {
-          console.error("Error processing snapshot in memory:", err);
-          sendError(`Error extracting analysis files: ${err.message}`);
+          safeLog("error", "analyze", "SNAPSHOT_PROCESSING_FAILED", {
+            error_class: safeErrorClass(err),
+          });
+          sendError(
+            "There was a problem retrieving the analysis output. Please try again.",
+          );
         }
       }
 
@@ -1323,8 +1602,14 @@ for f in files:
       if (err.name === "AbortError") {
         console.log(`[analyze] Agent interaction aborted successfully.`);
       } else {
-        console.error(`[analyze] Error:`, err);
-        sendError(err instanceof Error ? err.message : "Unknown error");
+        safeLog("error", "analyze", "UNEXPECTED_ANALYZE_ERROR", {
+          error_class: safeErrorClass(err),
+        });
+        // CP5.2 + CP5.3: never forward raw error text (may contain internal
+        // URLs or payload fragments) — send a safe generic message instead.
+        sendError(
+          "Something went wrong while processing your analysis. Please try again.",
+        );
       }
     } finally {
       isFinished = true;
@@ -1338,7 +1623,9 @@ for f in files:
       /*
      if (!isFollowUp && uploadedFiles.length > 0) {
        deleteGcsFiles(uploadedFiles).catch(err => {
-         console.error("[analyze] Error in background deleteGcsFiles:", err);
+         safeLog("error", "analyze", "BACKGROUND_GCS_DELETE_FAILED", {
+           error_class: safeErrorClass(err),
+         });
        });
      }
      */
@@ -1347,6 +1634,22 @@ for f in files:
 
   app.get("/api/health", (req, res) => {
     res.json({ status: "ok" });
+  });
+
+  // Offline BYOK key-format check. Uses the SAME centralized validator as
+  // /api/analyze (server/lib/keyValidation.ts) so behavior cannot drift.
+  // It only validates that the value looks like a plausible API key; it does
+  // NOT call Gemini, does NOT require the AIza prefix (the current
+  // source/docs do not guarantee every supported key uses it), does NOT store
+  // the key, does NOT log it, and does NOT return it. This is a UX hint only —
+  // a "valid format" key can still fail auth at the API.
+  app.post("/api/key-check", (req, res) => {
+    const validation = validateApiKey(req.body?.key);
+    const formatValid = validation.valid;
+    res.json({
+      format_valid: formatValid,
+      format_invalid: !formatValid,
+    });
   });
 
   // Vite middleware for development (with a robust fallback to dev middleware if dist/index.html is missing)
@@ -1384,7 +1687,7 @@ for f in files:
           console.log(`Port ${port} is in use, trying ${port + 1}...`);
           startListening(port + 1);
         } else {
-          console.error(err);
+          console.error(`[server] Listen failed (port ${port}).`);
         }
       });
 

@@ -1,0 +1,24 @@
+# Render blueprint — BangHeri AI Data Analyst (BYOK)
+# Docs: https://render.com/docs/blueprint-spec
+#
+# SECURITY NOTE: this app is BYOK (Bring Your Own Key). There is NO server-side
+# Gemini key and NO shared demo access key. Users provide their own Gemini API
+# key in the browser; it never touches the server's environment. PUBLIC_BASE_URL
+# is NOT a secret (it is the app's own public URL) and is set as a plain value.
+services:
+  - type: web
+    name: bangheri-ai-data-analyst
+    runtime: node
+    plan: free
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    # Controlled deploys are MANUAL. A push alone must not release to
+    # production; use the "Deploy" button in the Render dashboard.
+    autoDeploy: false
+    envVars:
+      - key: NODE_ENV
+        value: production
+      # Replace with this service's real public https:// URL.
+      - key: PUBLIC_BASE_URL
+        value: https://bangheri-ai-data-analyst.onrender.com

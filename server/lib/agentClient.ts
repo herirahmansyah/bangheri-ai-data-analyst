@@ -1,6 +1,12 @@
 /**
  * Gemini Managed Agents client.
  * The server only sends user prompts — no inline system instructions.
+ *
+ * CP5.1 (BYOK): the caller MUST pass the user's Gemini API key as the
+ * `apiKey` argument of each request. The key lives only in that request's
+ * local scope — it is never read from process.env, never cached, and never
+ * written to any persistent store. Concurrent requests therefore cannot mix
+ * one user's key with another's.
  */
 
 /* ────────────────────────────────────────────────────────── */
@@ -9,7 +15,10 @@
 
 export interface InteractionOptions {
   prompt: string;
-  agentName?: string;
+  /** Resolved via server/lib/modelCatalog.ts allowlist (never client-supplied raw). */
+  agentName: string;
+  /** The user's Gemini API key (BYOK). Required — no server-side fallback. */
+  apiKey: string;
   environmentId?: string;
   previousInteractionId?: string;
   stream?: boolean;
@@ -40,6 +49,8 @@ export interface AgentEvent {
   message?: string;
 }
 
+import { safeErrorClass, safeLog } from "./safeDiagnostics.ts";
+
 /* ────────────────────────────────────────────────────────── */
 /*  Create an interaction                                       */
 /* ────────────────────────────────────────────────────────── */
@@ -48,7 +59,7 @@ export const API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
 export async function createInteraction(
   opts: InteractionOptions
 ): Promise<Response> {
-  const agentName = opts.agentName ?? "antigravity-preview-05-2026";
+  const agentName = opts.agentName;
 
   const payload: Record<string, unknown> = {
     agent: agentName,
@@ -65,12 +76,41 @@ export async function createInteraction(
   if (opts.environmentId) {
     payload.environment = { env_id: opts.environmentId };
   } else {
-    const allowlist: any[] = [
-      {
-        domain: "generativelanguage.googleapis.com",
-        transform: { "x-goog-api-key": process.env.GEMINI_API_KEY },
-      }
-    ];
+    // Sandbox network egress decision (CP5.2):
+    //
+    // WHY `domain: "*"` is still REQUIRED:
+    //   The sandbox is a live Linux VM that must be able to reach the dynamic
+    //   deployment's own PUBLIC_BASE_URL (used by download_gcs.py to reach
+    //   THIS app) plus arbitrary package hosts for `pip install` of
+    //   agent/requirements.txt (pypi.org, files.pythonhosted.org, and
+    //   occasionally package-specific CDNs / self-hosted wheels). The agent's
+    //   code is LLM-generated at runtime, so the exact set of reachable hosts
+    //   cannot be predicted statically without risking breaking the workflow.
+    //
+    // KNOWN MINIMUM domains the bundled code actually uses:
+    //   - <PUBLIC_BASE_URL host>  → download_gcs.py proxy reach-back (this app)
+    //   - storage.googleapis.com  → direct GCS fallback downloads (Bearer
+    //                               token transform below, when a token exists)
+    //   - pypi.org / files.pythonhosted.org → `pip install -r requirements.txt`
+    //
+    // RISK (code-generated outbound network): a runtime-generated script could
+    // in principle fetch from any public host (SSRF-ish / exfiltration is not
+    // a hard blocker because the sandbox is Google-hosted, not on the customer
+    // network, but arbitrary egress is still undesirable for audit).
+    //
+    // TIGHTENING CHECKPOINT (BEFORE public production, NOT CP5.2):
+    //   After the controlled live test, switch the allowlist to the known
+    //   minimum { PUBLIC_BASE_URL host, storage.googleapis.com, pypi.org,
+    //   files.pythonhosted.org } and run the full pipeline; pin `pip` to that
+    //   index if needed. Do NOT tighten now — it would risk breaking the
+    //   agent pre-live.
+    //
+    // GEMINI KEY GUARANTEE: the user's BYOK key is NEVER added to this
+    // allowlist and never forwarded into the sandbox (see server.ts: it is
+    // only passed as `x-goog-api-key` on requests that originate from THIS
+    // server, not from inside the sandbox). Only the GCS Bearer token (when
+    // present) is forwarded here.
+    const allowlist: any[] = [];
 
     if (opts.gcsToken) {
       allowlist.push({
@@ -101,7 +141,7 @@ export async function createInteraction(
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "x-goog-api-key": process.env.GEMINI_API_KEY || "",
+      "x-goog-api-key": opts.apiKey,
       "x-server-timeout": "600",
       "Api-Revision": "2026-05-20",
       "x-goog-api-client": "applet-ai-data-analyst/1.0.0",
@@ -182,8 +222,16 @@ export async function* streamInteraction(
       if (event) yield event;
     }
   } catch (err: any) {
-    console.error(`[streamInteraction] Exception caught in read loop:`, err);
-    yield { type: "error", message: `Stream read exception: ${err.message}` };
+    safeLog("error", "streamInteraction", "READ_LOOP_FAILED", {
+      error_class: safeErrorClass(err),
+    });
+    // CP5.2 + CP5.3: never forward raw stream exception text (may contain
+    // internal URLs / payload fragments) — send a safe generic message instead.
+    yield {
+      type: "error",
+      message:
+        "The analysis stream was interrupted unexpectedly. Please try again.",
+    };
   } finally {
     reader.releaseLock();
   }

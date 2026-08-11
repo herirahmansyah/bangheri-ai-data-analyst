@@ -8,6 +8,7 @@ import autoTable from 'jspdf-autotable';
 import type {
   ActivityLog, AnalysisReport, ReportChart, ReportTable, UploadedFile,
 } from './types';
+import { isSafeChartUrl } from './lib/chartUrl';
 import { LogIn, LogOut, User as UserIcon, Check, Sparkles, Presentation, Database } from 'lucide-react';
 
 const PixelatedHeader: React.FC = () => {
@@ -89,6 +90,13 @@ function stageFromCommand(cmd: string): string | null {
   if (cmd.includes('pip install')) return 'Setting up environment...';
   return null;
 }
+
+// Chart image URL guard is defined in src/lib/chartUrl.ts (CP5.2) and is used
+// IDENTICALLY by the dashboard render and the PDF/export fetch. It rejects any
+// external scheme, protocol-relative URL, userinfo, query/fragment, and any
+// literal or percent-encoded path traversal; only same-origin paths whose
+// canonical pathname is under /output/ are allowed. Invalid URLs never trigger
+// a fetch or an <img> load.
 
 function sanitizeAgentText(text: string): string {
   if (!text) return text;
@@ -221,6 +229,16 @@ const App: React.FC = () => {
   const [uploadSessionId, setUploadSessionId] = useState(createUploadSessionId);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
   const [viewedMessageId, setViewedMessageId] = useState<string | null>(null);
+  // BYOK Gemini API key: entered at runtime, held ONLY in memory for the life
+  // of this page (NO localStorage, NO sessionStorage). Sent to the server as
+  // an `x-gemini-api-key` header ONLY on /api/analyze (the Gemini request);
+  // /api/upload and /api/health do not need it. Never logged, never put in a
+  // URL, never rendered back. Cleared with the Clear/Remove button.
+  const [geminiApiKey, setGeminiApiKey] = useState('');
+
+  const updateGeminiApiKey = (value: string) => {
+    setGeminiApiKey(value);
+  };
   const activeMessageIdRef = useRef<string | null>(null);
 
 
@@ -327,7 +345,7 @@ const App: React.FC = () => {
       setStatus('idle');
       setErrorMsg(null);
     } catch (err: any) {
-      setErrorMsg(err.message || 'Error uploading files');
+      setErrorMsg('Failed to upload files. Please try again.');
       setStatus('error');
     }
   }, [uploadSessionId]);
@@ -458,6 +476,10 @@ const App: React.FC = () => {
       setErrorMsg('This analysis session is no longer available. Start a new analysis and upload the dataset again.');
       return;
     }
+    if (geminiApiKey.trim() === '') {
+      setErrorMsg('Enter your Gemini API key in the header (top right) before running an analysis.');
+      return;
+    }
 
     setStatus('running');
     setStage('Initializing...');
@@ -506,6 +528,9 @@ const App: React.FC = () => {
       datasetName,
       generationId,
       environmentId: isFollowUp ? environmentId : undefined,
+      // Server-approved catalog id; the server resolves it to the real agent
+      // name via server/lib/modelCatalog.ts. Raw agent names are never sent.
+      catalogId: 'antigravity',
     };
 
     if (!isFollowUp) {
@@ -520,7 +545,12 @@ const App: React.FC = () => {
       for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         response = await fetch('/api/analyze', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            ...(geminiApiKey.trim() !== ''
+              ? { 'x-gemini-api-key': geminiApiKey.trim() }
+              : {}),
+          },
           body: JSON.stringify(payload),
           signal: controller.signal,
           redirect: 'manual',
@@ -594,8 +624,8 @@ const App: React.FC = () => {
           let event: any;
           try {
             event = JSON.parse(dataStr);
-          } catch (err) {
-            console.error(`Failed to parse SSE frame (len ${dataStr.length}):`, dataStr.slice(0, 200), err);
+          } catch {
+            console.error(`Failed to parse SSE frame (len ${dataStr.length}).`);
             streamError = streamError || 'The connection dropped or message was truncated mid-report.';
             break;
           }
@@ -668,7 +698,7 @@ const App: React.FC = () => {
       if (!streamError && buffer.trim().startsWith('data: ')) {
         const dataStr = buffer.trim().slice(6);
         if (dataStr && dataStr !== '[DONE]') {
-          console.error(`Incomplete SSE frame in buffer at stream end (len ${dataStr.length}):`, dataStr.slice(0, 200));
+          console.error(`Incomplete SSE frame in buffer at stream end (len ${dataStr.length}).`);
           streamError = 'The connection dropped or message was truncated mid-report.';
         }
       }
@@ -707,13 +737,13 @@ const App: React.FC = () => {
       });
     } catch (e: any) {
       if (e?.name === 'AbortError') return;
-      setErrorMsg(e?.message || 'Unexpected error');
+      setErrorMsg('The analysis could not be completed. Please try again.');
       setStatus('error');
       setChatMessages((prevChat) => {
         const idx = prevChat.findIndex((m) => m.id === assistantMsgId);
         if (idx !== -1) {
           const nextChat = [...prevChat];
-          nextChat[idx] = { ...nextChat[idx], status: 'error', text: (nextChat[idx].text || '') + `\n\nError: ${e?.message || 'Unexpected error'}` };
+          nextChat[idx] = { ...nextChat[idx], status: 'error', text: (nextChat[idx].text || '') + '\n\nThe analysis could not be completed. Please try again.' };
           return nextChat;
         }
         return prevChat;
@@ -755,8 +785,8 @@ const App: React.FC = () => {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ sessionId: sessionIdToClear }),
-    }).catch((err) => {
-      console.error('Failed to clear uploaded files:', err);
+    }).catch(() => {
+      console.error('Failed to clear uploaded files.');
     });
   };
 
@@ -772,6 +802,35 @@ const App: React.FC = () => {
         </div>
         
         <div className="flex items-center gap-3">
+          <form
+            className="flex items-center gap-2"
+            onSubmit={(e) => { e.preventDefault(); }}
+            aria-label="Gemini API key (BYOK)"
+          >
+            <label htmlFor="gemini-api-key" className="text-xs font-semibold uppercase tracking-wider text-neutral-500 font-mono">
+              Gemini Key
+            </label>
+            <input
+              id="gemini-api-key"
+              type="password"
+              autoComplete="off"
+              spellCheck={false}
+              placeholder="Paste your Gemini API key"
+              value={geminiApiKey}
+              onChange={(e) => updateGeminiApiKey(e.target.value)}
+              className="w-64 rounded-md border border-neutral-300 bg-white px-2 py-1 font-mono text-xs text-neutral-800 placeholder:text-neutral-400 focus:outline-none focus:ring-1 focus:ring-io-blue"
+            />
+            {geminiApiKey.trim() !== '' && (
+              <button
+                type="button"
+                onClick={() => updateGeminiApiKey('')}
+                className="rounded-md border border-neutral-300 bg-white px-2 py-1 text-xs font-semibold text-neutral-600 hover:bg-neutral-100"
+                title="Remove the Gemini API key from this session (memory only)"
+              >
+                Clear
+              </button>
+            )}
+          </form>
         </div>
       </header>
 
@@ -1788,22 +1847,26 @@ const ReportView: React.FC<{ report: AnalysisReport }> = ({ report }) => {
           }
 
           try {
+            // CP5: reject unsafe chart URLs BEFORE any fetch or image load.
+            if (!isSafeChartUrl(chart.image)) {
+              console.warn('Skipping chart with unsafe URL in PDF export.');
+              continue;
+            }
             let imageSourceUrl = chart.image;
-            if (imageSourceUrl.startsWith('/') || imageSourceUrl.startsWith('http')) {
-              try {
-                const res = await fetch(imageSourceUrl);
-                if (res.ok) {
-                  const blob = await res.blob();
-                  imageSourceUrl = await new Promise<string>((resolve, reject) => {
-                    const reader = new FileReader();
-                    reader.onloadend = () => resolve(reader.result as string);
-                    reader.onerror = reject;
-                    reader.readAsDataURL(blob);
-                  });
-                }
-              } catch (fetchErr) {
-                console.warn('Failed to fetch chart image as blob for PDF export:', fetchErr);
+            // Same-origin /output/ path → safe to fetch as a blob for embedding.
+            try {
+              const res = await fetch(imageSourceUrl);
+              if (res.ok) {
+                const blob = await res.blob();
+                imageSourceUrl = await new Promise<string>((resolve, reject) => {
+                  const reader = new FileReader();
+                  reader.onloadend = () => resolve(reader.result as string);
+                  reader.onerror = reject;
+                  reader.readAsDataURL(blob);
+                });
               }
+            } catch (fetchErr) {
+              console.warn('Failed to fetch chart image as blob for PDF export.');
             }
 
             const imgProps = await new Promise<{ dataUrl: string; width: number; height: number }>((resolve) => {
@@ -1861,7 +1924,7 @@ const ReportView: React.FC<{ report: AnalysisReport }> = ({ report }) => {
             pdf.addImage(imgProps.dataUrl, 'PNG', imgX, y, imgW, imgH);
             y += imgH + 10;
           } catch (err) {
-            console.warn('Could not render chart in PDF', err);
+            console.warn('Could not render chart in PDF.');
           }
         }
       }
@@ -1944,7 +2007,7 @@ const ReportView: React.FC<{ report: AnalysisReport }> = ({ report }) => {
       const cleanName = (report.dataset_name || 'AI_Analysis').replace(/[^a-zA-Z0-9]/g, '_');
       pdf.save(`${cleanName}_Executive_Dashboard.pdf`);
     } catch (err) {
-      console.error('PDF export failed:', err);
+      console.error('PDF export failed.');
       alert('Failed to generate PDF. Please try again.');
     } finally {
       setIsExportingPdf(false);
@@ -2413,7 +2476,7 @@ const SectionTitle: React.FC<{ title: string }> = ({ title }) => (
 
 const ChartImage: React.FC<{ src: string; alt: string; className?: string }> = ({ src, alt, className = '' }) => {
   const [error, setError] = useState(false);
-  if (error) {
+  if (error || !isSafeChartUrl(src)) {
     return (
       <div className={`flex flex-col items-center justify-center p-6 bg-neutral-50 rounded-xl border border-dashed border-neutral-300 text-neutral-400 text-xs text-center min-h-[140px] w-full ${className}`}>
         <span>📈 Chart image expired or unavailable</span>

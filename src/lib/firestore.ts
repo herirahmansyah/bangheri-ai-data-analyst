@@ -21,8 +21,8 @@ function getLocalReports(): SavedReport[] {
   try {
     const data = localStorage.getItem('saved_reports');
     return data ? JSON.parse(data) : [];
-  } catch (e) {
-    console.error('Error reading from localStorage:', e);
+  } catch {
+    console.error('Error reading saved reports from localStorage.');
     return [];
   }
 }
